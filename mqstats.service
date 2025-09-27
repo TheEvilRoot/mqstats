@@ -1,0 +1,13 @@
+[Unit]
+Description=MQTT system stats server for Home Assistant
+After=network.target
+
+[Service]
+type=exec
+EnvironmentFile=/etc/default/mqstats
+WorkingDirectory=/opt/mqstats
+ExecStart=/opt/mqstats/venv/bin/python /opt/mqstats/mqstats/__init__.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
