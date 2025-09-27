@@ -48,6 +48,7 @@ Following configuration variables are present in `/etc/default/mqstats`
 MQSTATS_DEVICE_NAME=vps_1 # device name, defaults to hostname
 MQSTATS_BASE_TOPIC=mqstats # base topic for MQTT (e.g. mqstats/{device_id}/{sensor_id}), defauts to mqstats
 MQSTATS_NICS=en3,en1,en2,en0,en4 # list of nics to acquire stats for, see `ip link`. defaults to empty list
+MQSTATS_DISK=root=/,disk1=/mnt/disk1,disk2=/mnt/disk2 # list of disks to acuqire stats for; format is `name=path`
 
 MQSTATS_MQTT_HOST=localhost # mqtt broker hostname
 MQSTATS_MQTT_PORT=1883 # mqtt broker 

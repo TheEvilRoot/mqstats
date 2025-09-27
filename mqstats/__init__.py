@@ -32,6 +32,17 @@ def int_from_env(key: str, default: int) -> int:
     except ValueError:
         raise Exception(f'Value of {key} is not an integer: {value}')
 
+def map_from_env(key: str) -> dict:
+    value = list_from_env(key)
+    ret = {}
+    for kv in value:
+        key_value = kv.split('=', maxsplit=1)
+        if len(key_value) != 2: raise Exception(f'Map {key} contains invalid key-value pair: {kv}')
+        k, v = key_value
+        ret[k] = v
+    return ret
+
+
 MQSTATS_DEVICE_NAME = from_env('MQSTATS_DEVICE_NAME', socket.gethostname())
 MQSTATS_BASE_TOPIC = from_env('MQSTATS_BASE_TOPIC', 'mqstats')
 
@@ -42,6 +53,7 @@ MQSTATS_MQTT_PASSWORD = from_env('MQSTATS_MQTT_PASSWORD', '')
 
 MQSTATS_SENSOR_INTERVAL = int_from_env('MQSTATS_SENSOR_INTERVAL', 2)
 MQSTATS_NICS = list_from_env('MQSTATS_NICS')
+MQSTATS_DISKS = map_from_env('MQSTATS_DISKS')
 
 
 def sanitize_id(name: str) -> str:
@@ -91,9 +103,10 @@ def discovery_config() -> dict:
         **sensor_config('memory_percent', 'Memory%', '%', '{{ value_json.memory_percent | round(0) }}', precision=0),
         **sensor_config('memory_used', 'Memory used', 'MB', '{{ value_json.memory_used / (1024 * 1024) | round(1) }}', precision=1),
         **sensor_config('memory_free', 'Memory free', 'MB', '{{ value_json.memory_free / (1024 * 1024) | round(1) }}', precision=1),
-        **sensor_config('disk_percent', 'Disk%', '%', '{{ value_json.disk_used | round(1) }}', precision=1),
-        **sensor_config('disk_free', 'Disk free', 'MB', '{{ value_json.disk_free / (1024 * 1024) | round(2) }}', precision=2),
     }}
+    for disk in MQSTATS_DISKS.keys():
+        base['cmps'] |= sensor_config(f'disk_{disk}_percent', f'Disk {disk}%', '%', '{{ value_json.disk_percent | round(1) }}', precision=1)
+        base['cmps'] |= sensor_config(f'disk_{disk}_free', f'Disk {disk} free', 'MB', '{{ value_json.disk_free / (1024 * 1024) | round(2) }}',precision=2)
     for nic in MQSTATS_NICS:
         base['cmps'] |= sensor_config(f'nic_{nic}_speed', f'{nic} link', 'Mbps', '{{ value_json.nic_speed | round(0) }}', precision=0)
         base['cmps'] |= sensor_config(f'nic_{nic}_upload', f'{nic} upload', 'Mbps', '{{ value_json.nic_upload / (1024 * 1024) | round(2) }}', precision=0)
@@ -142,8 +155,7 @@ def collection_handler(client: mqtt.Client):
         memory = psutil.virtual_memory()
         memory_used = memory.percent
         memory_free = memory.free
-        disk_used = psutil.disk_usage('/').percent
-        disk_free = psutil.disk_usage('/').free
+
         net_stats = psutil.net_if_stats()
         net_counters = psutil.net_io_counters(pernic=True)
         for nic in MQSTATS_NICS:
@@ -159,10 +171,13 @@ def collection_handler(client: mqtt.Client):
         send_message(client, find_topic('memory_percent'), {'memory_percent': memory_used})
         send_message(client, find_topic('memory_used'), {'memory_used': memory_used})
         send_message(client, find_topic('memory_free'), {'memory_free': memory_free})
-        send_message(client, find_topic('disk_percent'), {'disk_used': disk_used})
-        send_message(client, find_topic('disk_free'), {'disk_free': disk_free})
+        for disk, path in MQSTATS_DISKS.items():
+            disk_usage = psutil.disk_usage(path)
+            send_message(client, find_topic(f'disk_{disk}_percent'), {'disk_percent': disk_usage.percent})
+            send_message(client, find_topic(f'disk_{disk}_free'), {'disk_free': disk_usage.free})
         end = datetime.datetime.now()
-        logging.info(f'Complete collection in {(end - start).total_seconds()} seconds')
+        if abs((end - start).total_seconds() - MQSTATS_SENSOR_INTERVAL) > MQSTATS_SENSOR_INTERVAL:
+            logging.warning(f'Complete collection in {(end - start).total_seconds()} seconds')
 
 def main():
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', stream=sys.stdout)
