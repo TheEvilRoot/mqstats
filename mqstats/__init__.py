@@ -160,8 +160,8 @@ def collection_handler(client: mqtt.Client):
         net_counters = psutil.net_io_counters(pernic=True)
         for nic in MQSTATS_NICS:
             nic_speed = net_stats[nic].speed
-            download_speed = net_counters[nic].bytes_recv - prev_counters[nic].bytes_recv
-            upload_speed = net_counters[nic].bytes_sent - prev_counters[nic].bytes_sent
+            download_speed = (net_counters[nic].bytes_recv - prev_counters[nic].bytes_recv) * 8
+            upload_speed = (net_counters[nic].bytes_sent - prev_counters[nic].bytes_sent) * 8
             send_message(client, find_topic(f'nic_{nic}_download'), {'nic_download': download_speed})
             send_message(client, find_topic(f'nic_{nic}_upload'), {'nic_upload': upload_speed})
             send_message(client, find_topic(f'nic_{nic}_speed'), {'nic_speed': nic_speed})
