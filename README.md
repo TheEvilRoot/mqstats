@@ -21,11 +21,10 @@ config file in `/etc/default/mqstats` by default, copy `mqstats.service` to
 ```shell
 # clone repository, install requirements and setup systemd service files
 git clone https://github.com/theevilroot/mqstats /opt/mqstats
+cd /opt/mqstats/
 python3 -m venv venv
 source venv/bin/activate
 pip3 install -r requirements.txt
-
-cd /opt/mqstats/
 cp sample.env /etc/default/mqstats
 cp mqstats.service /etc/systemd/system/mqstats.service
 

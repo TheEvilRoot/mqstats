@@ -92,7 +92,7 @@ def discovery_config() -> dict:
         **sensor_config('memory_used', 'Memory used', 'MB', '{{ value_json.memory_used / (1024 * 1024) | round(1) }}', precision=1),
         **sensor_config('memory_free', 'Memory free', 'MB', '{{ value_json.memory_free / (1024 * 1024) | round(1) }}', precision=1),
         **sensor_config('disk_percent', 'Disk%', '%', '{{ value_json.disk_used | round(1) }}', precision=1),
-        **sensor_config('disk_free', 'Disk free', 'GB', '{{ value_json.disk_free / (1024 * 1024) | round(2) }}', precision=2),
+        **sensor_config('disk_free', 'Disk free', 'MB', '{{ value_json.disk_free / (1024 * 1024) | round(2) }}', precision=2),
     }}
     for nic in MQSTATS_NICS:
         base['cmps'] |= sensor_config(f'nic_{nic}_speed', f'{nic} link', 'Mbps', '{{ value_json.nic_speed | round(0) }}', precision=0)
