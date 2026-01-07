@@ -4,44 +4,15 @@ import logging
 import socket
 import platform
 import sys
+import time
+from typing import Callable
 
+import paho.mqtt.client
 import psutil
-import os
 
 import paho.mqtt.client as mqtt
-
-def from_env(key: str, default: str) -> str:
-    """Get value from environment variable or return default if empty or unset"""
-    value = os.environ.get(key, '')
-    return default if value is None or len(value) == 0 else value
-
-def list_from_env(key: str) -> list:
-    """Get list value from environment variable.
-       List is defined as string of comma separated values"""
-    value = from_env(key, '')
-    return [value.strip() for value in value.split(',') if len(value.strip()) > 0]
-
-def int_from_env(key: str, default: int) -> int:
-    """Get int value from environment variable or return default if empty or unset
-       Throw an error when value is not an integer"""
-    value = from_env(key, '')
-    if value is None or len(value) == 0:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        raise Exception(f'Value of {key} is not an integer: {value}')
-
-def map_from_env(key: str) -> dict:
-    value = list_from_env(key)
-    ret = {}
-    for kv in value:
-        key_value = kv.split('=', maxsplit=1)
-        if len(key_value) != 2: raise Exception(f'Map {key} contains invalid key-value pair: {kv}')
-        k, v = key_value
-        ret[k] = v
-    return ret
-
+from ha_mqtt_discovery import Discovery, Device, Sensor, sanitize_name
+from mqstats.utils import *
 
 MQSTATS_DEVICE_NAME = from_env('MQSTATS_DEVICE_NAME', socket.gethostname())
 MQSTATS_BASE_TOPIC = from_env('MQSTATS_BASE_TOPIC', 'mqstats')
@@ -52,71 +23,114 @@ MQSTATS_MQTT_USERNAME = from_env('MQSTATS_MQTT_USERNAME', '')
 MQSTATS_MQTT_PASSWORD = from_env('MQSTATS_MQTT_PASSWORD', '')
 
 MQSTATS_SENSOR_INTERVAL = int_from_env('MQSTATS_SENSOR_INTERVAL', 2)
+MQSTATS_DISCOVER_INTERVAL = int_from_env('MQSTATS_DISCOVER_INTERVAL', 10)
 MQSTATS_NICS = list_from_env('MQSTATS_NICS')
 MQSTATS_DISKS = map_from_env('MQSTATS_DISKS')
+MQSTATS_SENSORS = map_from_env('MQSTATS_SENSORS')
+
+class Tick:
+    def __init__(self, client: paho.mqtt.client.Client):
+        self.memory = psutil.virtual_memory()
+        self.net_stats = psutil.net_if_stats()
+        self.net_counters = psutil.net_io_counters(pernic=True)
+        self.now = datetime.datetime.now()
+        self.client = client
+
+    def send_message(self, topic: str, message: dict):
+        self.client.publish(topic, json.dumps(message))
+
+class CpuPercent(Sensor):
+    def __init__(self, device: Device):
+        super().__init__(device, 'CPU%', None, '%', '{{ value_json.cpu_percent | round(1) }}', 'cpu_percent', 1)
+        self.state_class = 'measurement'
+        self.state = None
+
+    def on_tick(self, tick: Tick):
+        self.state = psutil.cpu_percent(interval=MQSTATS_SENSOR_INTERVAL)
+        return tick.send_message(self.state_topic, {'cpu_percent': self.state})
+
+class CpuFreq(Sensor):
+    def __init__(self, device: Device):
+        super().__init__(device, 'CPU Frequency', 'frequency', 'Mhz', '{{ value_json.cpu_freq | int }}', 'cpu_freq', 0)
+        self.state_class = 'measurement'
+        self.state = None
+
+    def on_tick(self, tick: Tick):
+        self.state = psutil.cpu_freq().current
+        return tick.send_message(self.state_topic, {'cpu_freq': self.state})
+
+class RamSensor(Sensor):
+    def __init__(self, device: Device, name: str, sensor_id: str, getter: Callable):
+        super().__init__(device, name, '%', None, f'{{{{ value_json.{sensor_id} | int }}}}', sensor_id, 0)
+        self.state_class = 'measurement'
+        self.getter = getter
+        self.state = None
+
+    def on_tick(self, tick: Tick):
+        self.state = self.getter(tick.memory)
+        return tick.send_message(self.state_topic, {self.sensor_id: self.state})
+
+class DiskPercent(Sensor):
+    def __init__(self, device: Device, disk_name: str, path: str):
+        super().__init__(device, f'Disk {disk_name}%', '%', None, '{{ value_json.disk_percent | round(1) }}', f'disk_{sanitize_name(disk_name)}_percent', 1)
+        self.state_class = 'measurement'
+        self.path = path
+        self.disk_name = disk_name
+        self.state = None
+
+    def on_tick(self, tick: Tick):
+        disk_usage = psutil.disk_usage(self.path)
+        self.state = disk_usage.percent
+        return tick.send_message(self.state_topic, {'disk_percent': self.state})
+
+class DiskFree(Sensor):
+    def __init__(self, device: Device, disk_name: str, path: str):
+        super().__init__(device, f'Disk {disk_name} free', 'MB', 'data_size', '{{ value_json.disk_free | round(2) }}', f'disk_{sanitize_name(disk_name)}_free', 2)
+        self.state_class = 'measurement'
+        self.disk_name = disk_name
+        self.path = path
+        self.state = None
+
+    def on_tick(self, tick: Tick):
+        disk_usage = psutil.disk_usage(self.path)
+        self.state = disk_usage.free
+        return tick.send_message(self.state_topic, {'disk_free': self.state})
+
+class NicLink(Sensor):
+    def __init__(self, device: Device, path: str):
+        super().__init__(device, f'{path} link', 'Mbit/s', 'data_rate', '{{ value_json.nic_speed | int }}', f'nic_{path}_speed', 0)
+        self.state_class = 'measurement'
+        self.path = path
+        self.state = None
+
+    def on_tick(self, tick: Tick):
+        self.state = tick.net_stats[self.path].speed
+        return tick.send_message(self.state_topic, {'nic_speed': self.state})
+
+class NicTrack(Sensor):
+    def __init__(self, device: Device, field: str, path: str, getter: Callable):
+        super().__init__(device, f'{path} {field}', 'Mbit/s', 'data_rate', f'{{{{ value_json.nic_{field} | int }}}}',
+                         f'nic_{path}_{field}', 0)
+        self.state_class = 'measurement'
+        self.field = field
+        self.path = path
+        self.getter = getter
+        self.state = None
+        self.prev = None
+
+    def on_tick(self, tick: Tick):
+        if self.prev is None:
+            self.prev = (tick.net_counters[self.path], tick.now)
+            return None
+        prev, prev_date = self.prev
+        prev_delta = (tick.now - prev_date).total_seconds()
+        self.state = ((self.getter(tick.net_counters[self.path]) - self.getter(prev)) * 8) / prev_delta
+        self.prev = (tick.net_counters[self.path], tick.now)
+        return tick.send_message(self.state_topic, {f'nic_{self.field}': self.state})
 
 
-def sanitize_id(name: str) -> str:
-    """Make home assistant compatible identifier from name"""
-    return name.lower().replace('-', '_').replace(' ', '_')
-
-def device_id() -> str:
-    """Device name as sanitised identifier"""
-    return sanitize_id(MQSTATS_DEVICE_NAME)
-
-def device_config():
-    """Config with information about device"""
-    return {
-        'name': MQSTATS_DEVICE_NAME,
-        'model': platform.machine(),
-        'model_id': platform.machine(),
-        'identifiers': [device_id()],
-    }
-
-def program_config():
-    """Config with information about collection program"""
-    return {
-        'name': 'mqstats',
-        'sw': '1.0',
-        'url': 'https://github.com/TheEvilRoot/mqstats',
-    }
-
-def sensor_config(sensor_id: str, name: str, unit: str, template: str, precision: int = 2):
-    """Create base of sensor configuration
-       Use as { 'cmps': {**sensor_config('a'), **sensor_config('b')} } """
-    return {sanitize_id(sensor_id): {
-        'name': name,
-        'platform': 'sensor',
-        'state_class': 'measurement',
-        'state_topic': f'{MQSTATS_BASE_TOPIC}/{device_id()}/{sanitize_id(sensor_id)}',
-        'suggested_display_precision': precision,
-        'unit_of_measurement': unit,
-        'value_template': template,
-        'unique_id': f'{device_id()}_{sanitize_id(sensor_id)}',
-    }}
-
-def discovery_config() -> dict:
-    """Create discovery config for Home Assistant"""
-    base = {'o': program_config(), 'dev': device_config(), 'cmps': {
-        **sensor_config('cpu_percent', 'CPU%', '%', '{{ value_json.cpu_percent | round(1) }}', precision=1),
-        **sensor_config('cpu_freq', 'CPU Frequency', 'MHz', '{{ value_json.cpu_freq | round(0) }}', precision=0),
-        **sensor_config('memory_percent', 'Memory%', '%', '{{ value_json.memory_percent | round(0) }}', precision=0),
-        **sensor_config('memory_used', 'Memory used', 'MB', '{{ value_json.memory_used / (1024 * 1024) | round(1) }}', precision=1),
-        **sensor_config('memory_free', 'Memory free', 'MB', '{{ value_json.memory_free / (1024 * 1024) | round(1) }}', precision=1),
-    }}
-    for disk in MQSTATS_DISKS.keys():
-        base['cmps'] |= sensor_config(f'disk_{disk}_percent', f'Disk {disk}%', '%', '{{ value_json.disk_percent | round(1) }}', precision=1)
-        base['cmps'] |= sensor_config(f'disk_{disk}_free', f'Disk {disk} free', 'MB', '{{ value_json.disk_free / (1024 * 1024) | round(2) }}',precision=2)
-    for nic in MQSTATS_NICS:
-        base['cmps'] |= sensor_config(f'nic_{nic}_speed', f'{nic} link', 'Mbps', '{{ value_json.nic_speed | round(0) }}', precision=0)
-        base['cmps'] |= sensor_config(f'nic_{nic}_upload', f'{nic} upload', 'Mbps', '{{ value_json.nic_upload / (1024 * 1024) | round(2) }}', precision=0)
-        base['cmps'] |= sensor_config(f'nic_{nic}_download', f'{nic} download', 'Mbps', '{{ value_json.nic_download / (1024 * 1024) | round(2) }}', precision=0)
-    return base
-
-def send_message(client: mqtt.Client, topic: str, message: dict):
-    """Send JSON message to topic"""
-    if topic is not None:
-        client.publish(topic, json.dumps(message))
+# fan_sensor_stats = psutil.sensors_fans() if hasattr(psutil._psplatform, "sensors_fans") else {}
+# temp_sensor_stats = psutil.sensors_temperatures(False) if hasattr(psutil._psplatform, "sensors_temperatures") else {}
 
 def create_mqtt_client():
     def on_connect(*args, **kwargs):
@@ -139,51 +153,44 @@ def create_mqtt_client():
     return client
 
 def collection_handler(client: mqtt.Client):
-    discovery = discovery_config()
-    def find_topic(sensor_id: str) -> str:
-        sensor = discovery['cmps'][sanitize_id(sensor_id)]
-        return sensor['state_topic']
+    discovery = Discovery(MQSTATS_BASE_TOPIC)
+    discovery.name = 'mqstats'
+    discovery.version = '1.2'
+    discovery.url = 'https://github.com/TheEvilRoot/mqstats'
+    device = Device(discovery, MQSTATS_DEVICE_NAME, platform.machine(), platform.machine())
+    CpuPercent(device)
+    CpuFreq(device)
+    RamSensor(device, 'Memory%', 'memory_percent', lambda x: x.percent)
+    RamSensor(device, 'Memory used', 'memory_used', lambda x: x.percent)
+    RamSensor(device, 'Memory free', 'memory_free', lambda x: x.percent)
 
-    discovery_topic = f'homeassistant/device/{device_id()}/config'
-    send_message(client, discovery_topic, discovery)
+    for disk_name, disk_path in MQSTATS_DISKS.items():
+        DiskPercent(device, disk_name, disk_path)
+        DiskFree(device, disk_name, disk_path)
 
-    prev_counters = psutil.net_io_counters(pernic=True)
+    for nic in MQSTATS_NICS:
+        NicLink(device, nic)
+        NicTrack(device, 'upload', nic, lambda x: x.bytes_sent)
+        NicTrack(device, 'download', nic, lambda x: x.bytes_recv)
+
+    discovery_time = datetime.datetime.now()
     while True:
-        start = datetime.datetime.now()
-        cpu_percent = psutil.cpu_percent(interval=MQSTATS_SENSOR_INTERVAL)
-        cpu_freq = psutil.cpu_freq().current
-        memory = psutil.virtual_memory()
-        memory_used = memory.percent
-        memory_free = memory.free
-
-        net_stats = psutil.net_if_stats()
-        net_counters = psutil.net_io_counters(pernic=True)
-        for nic in MQSTATS_NICS:
-            nic_speed = net_stats[nic].speed
-            download_speed = ((net_counters[nic].bytes_recv - prev_counters[nic].bytes_recv) * 8) / MQSTATS_SENSOR_INTERVAL
-            upload_speed = ((net_counters[nic].bytes_sent - prev_counters[nic].bytes_sent) * 8) / MQSTATS_SENSOR_INTERVAL
-            send_message(client, find_topic(f'nic_{nic}_download'), {'nic_download': download_speed})
-            send_message(client, find_topic(f'nic_{nic}_upload'), {'nic_upload': upload_speed})
-            send_message(client, find_topic(f'nic_{nic}_speed'), {'nic_speed': nic_speed})
-        prev_counters = net_counters
-        send_message(client, find_topic('cpu_percent'), {'cpu_percent': cpu_percent})
-        send_message(client, find_topic('cpu_freq'), {'cpu_freq': cpu_freq})
-        send_message(client, find_topic('memory_percent'), {'memory_percent': memory_used})
-        send_message(client, find_topic('memory_used'), {'memory_used': memory_used})
-        send_message(client, find_topic('memory_free'), {'memory_free': memory_free})
-        for disk, path in MQSTATS_DISKS.items():
-            disk_usage = psutil.disk_usage(path)
-            send_message(client, find_topic(f'disk_{disk}_percent'), {'disk_percent': disk_usage.percent})
-            send_message(client, find_topic(f'disk_{disk}_free'), {'disk_free': disk_usage.free})
+        tick = Tick(client)
+        for sensor in device.sensors.values():
+            sensor.on_tick(tick)
+        start = tick.now
         end = datetime.datetime.now()
         if abs((end - start).total_seconds() - MQSTATS_SENSOR_INTERVAL) > MQSTATS_SENSOR_INTERVAL:
             logging.warning(f'Complete collection in {(end - start).total_seconds()} seconds')
+        if (end - discovery_time).total_seconds() >= MQSTATS_DISCOVER_INTERVAL:
+            tick.send_message(discovery.discovery_topic(), discovery.build())
+        time.sleep(0.1)
 
 def main():
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', stream=sys.stdout)
-
     client = create_mqtt_client()
     collection_handler(client)
+
 
 if __name__ == '__main__':
     main()

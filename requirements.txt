@@ -1,2 +1,4 @@
 psutil
 paho-mqtt
+
+git+https://github.com/TheEvilRoot/ha-mqtt-discovery
