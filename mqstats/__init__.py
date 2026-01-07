@@ -26,15 +26,34 @@ MQSTATS_SENSOR_INTERVAL = int_from_env('MQSTATS_SENSOR_INTERVAL', 2)
 MQSTATS_DISCOVER_INTERVAL = int_from_env('MQSTATS_DISCOVER_INTERVAL', 10)
 MQSTATS_NICS = list_from_env('MQSTATS_NICS')
 MQSTATS_DISKS = map_from_env('MQSTATS_DISKS')
-MQSTATS_SENSORS = map_from_env('MQSTATS_SENSORS')
+
+def find_fans():
+    ret = {}
+    devices = psutil.sensors_fans() if hasattr(psutil._psplatform, "sensors_fans") else {}
+    for device_id, fans in devices.items():
+        for idx, fan in enumerate(fans):
+            label = f'{idx}' if len(fan.label) == 0 else fan.label
+            ret[f'{device_id} {label}'] = fan
+    return ret 
+
+def find_temps():
+    ret = {}
+    devices = psutil.sensors_temperatures(False) if hasattr(psutil._psplatform, "sensors_temperatures") else {}
+    for device_id, sensors in devices.items():
+        for idx, sensor in enumerate(sensors):
+            label = f'{idx}' if len(sensor.label) == 0 else sensor.label
+            ret[f'{device_id} {label}'] = sensor
+    return ret
 
 class Tick:
     def __init__(self, client: paho.mqtt.client.Client):
+        self.client = client
         self.memory = psutil.virtual_memory()
         self.net_stats = psutil.net_if_stats()
         self.net_counters = psutil.net_io_counters(pernic=True)
         self.now = datetime.datetime.now()
-        self.client = client
+        self.fans = find_fans()
+        self.temps = find_temps()
 
     def send_message(self, topic: str, message: dict):
         self.client.publish(topic, json.dumps(message))
@@ -128,9 +147,33 @@ class NicTrack(Sensor):
         self.prev = (tick.net_counters[self.path], tick.now)
         return tick.send_message(self.state_topic, {f'nic_{self.field}': self.state})
 
+class FanSensor(Sensor):
+    def __init__(self, device: Device, path: str):
+        super().__init__(device, f'Fan {path}', 'rpm', None, f'{{{{ value_json.fan_rpm | int }}}}',
+                         f'fan_{sanitize_name(path)}_rpm', 0)
+        self.state_class = 'measurement'
+        self.path = path
 
-# fan_sensor_stats = psutil.sensors_fans() if hasattr(psutil._psplatform, "sensors_fans") else {}
-# temp_sensor_stats = psutil.sensors_temperatures(False) if hasattr(psutil._psplatform, "sensors_temperatures") else {}
+    def on_tick(self, tick: Tick):
+       fan = tick.fans.get(self.path, None) 
+       if fan is not None:
+           self.state = tick.fans[self.path].current 
+           return tick.send_message(self.state_topic, {f'fan_rpm': self.state})
+       return None
+
+class TempSensor(Sensor):
+    def __init__(self, device: Device, path: str):
+        super().__init__(device, f'Temp {path}', '°C',None, f'{{{{ value_json.temp | int }}}}',
+                         f'temp_{sanitize_name(path)}', 2)
+        self.state_class = 'measurement'
+        self.path = path
+
+    def on_tick(self, tick: Tick):
+       temp = tick.temps.get(self.path, None) 
+       if temp is not None:
+           self.state = tick.temps[self.path].current 
+           return tick.send_message(self.state_topic, {f'temp': self.state})
+       return None
 
 def create_mqtt_client():
     def on_connect(*args, **kwargs):
@@ -155,7 +198,7 @@ def create_mqtt_client():
 def collection_handler(client: mqtt.Client):
     discovery = Discovery(MQSTATS_BASE_TOPIC)
     discovery.name = 'mqstats'
-    discovery.version = '1.2'
+    discovery.version = '1.3'
     discovery.url = 'https://github.com/TheEvilRoot/mqstats'
     device = Device(discovery, MQSTATS_DEVICE_NAME, platform.machine(), platform.machine())
     CpuPercent(device)
@@ -173,9 +216,16 @@ def collection_handler(client: mqtt.Client):
         NicTrack(device, 'upload', nic, lambda x: x.bytes_sent)
         NicTrack(device, 'download', nic, lambda x: x.bytes_recv)
 
-    discovery_time = datetime.datetime.now()
+    for path, fan in find_fans().items():
+        FanSensor(device, path)
+
+    for path, fan in find_temps().items():
+        TempSensor(device, path)
+
+    discovery_time = datetime.datetime.fromtimestamp(0)
     while True:
         tick = Tick(client)
+        tick.send_message(discovery.discovery_topic(), discovery.build())
         for sensor in device.sensors.values():
             sensor.on_tick(tick)
         start = tick.now
