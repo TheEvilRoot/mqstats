@@ -61,7 +61,6 @@ class Tick:
 class CpuPercent(Sensor):
     def __init__(self, device: Device):
         super().__init__(device, 'CPU%', None, '%', '{{ value_json.cpu_percent | round(1) }}', 'cpu_percent', 1)
-        self.state_class = 'measurement'
         self.state = None
 
     def on_tick(self, tick: Tick):
@@ -70,8 +69,7 @@ class CpuPercent(Sensor):
 
 class CpuFreq(Sensor):
     def __init__(self, device: Device):
-        super().__init__(device, 'CPU Frequency', 'frequency', 'Mhz', '{{ value_json.cpu_freq | int }}', 'cpu_freq', 0)
-        self.state_class = 'measurement'
+        super().__init__(device, 'CPU Frequency', 'frequency', 'MHz', '{{ value_json.cpu_freq | int }}', 'cpu_freq', 0)
         self.state = None
 
     def on_tick(self, tick: Tick):
@@ -80,8 +78,7 @@ class CpuFreq(Sensor):
 
 class RamSensor(Sensor):
     def __init__(self, device: Device, name: str, sensor_id: str, getter: Callable):
-        super().__init__(device, name, '%', None, f'{{{{ value_json.{sensor_id} | int }}}}', sensor_id, 0)
-        self.state_class = 'measurement'
+        super().__init__(device, name, None, '%', f'{{{{ value_json.{sensor_id} | int }}}}', sensor_id, 0)
         self.getter = getter
         self.state = None
 
@@ -91,8 +88,7 @@ class RamSensor(Sensor):
 
 class DiskPercent(Sensor):
     def __init__(self, device: Device, disk_name: str, path: str):
-        super().__init__(device, f'Disk {disk_name}%', '%', None, '{{ value_json.disk_percent | round(1) }}', f'disk_{sanitize_name(disk_name)}_percent', 1)
-        self.state_class = 'measurement'
+        super().__init__(device, f'Disk {disk_name}%', None, '%', '{{ value_json.disk_percent | round(1) }}', f'disk_{sanitize_name(disk_name)}_percent', 1)
         self.path = path
         self.disk_name = disk_name
         self.state = None
@@ -104,21 +100,19 @@ class DiskPercent(Sensor):
 
 class DiskFree(Sensor):
     def __init__(self, device: Device, disk_name: str, path: str):
-        super().__init__(device, f'Disk {disk_name} free', 'MB', 'data_size', '{{ value_json.disk_free | round(2) }}', f'disk_{sanitize_name(disk_name)}_free', 2)
-        self.state_class = 'measurement'
+        super().__init__(device, f'Disk {disk_name} free', 'data_size', 'MB', '{{ value_json.disk_free | round(2) }}', f'disk_{sanitize_name(disk_name)}_free', 2)
         self.disk_name = disk_name
         self.path = path
         self.state = None
 
     def on_tick(self, tick: Tick):
         disk_usage = psutil.disk_usage(self.path)
-        self.state = disk_usage.free
+        self.state = disk_usage.free / (1024 * 1024) 
         return tick.send_message(self.state_topic, {'disk_free': self.state})
 
 class NicLink(Sensor):
     def __init__(self, device: Device, path: str):
-        super().__init__(device, f'{path} link', 'Mbit/s', 'data_rate', '{{ value_json.nic_speed | int }}', f'nic_{path}_speed', 0)
-        self.state_class = 'measurement'
+        super().__init__(device, f'{path} link', 'data_rate', 'Mbit/s', '{{ value_json.nic_speed | int }}', f'nic_{path}_speed', 0)
         self.path = path
         self.state = None
 
@@ -128,9 +122,8 @@ class NicLink(Sensor):
 
 class NicTrack(Sensor):
     def __init__(self, device: Device, field: str, path: str, getter: Callable):
-        super().__init__(device, f'{path} {field}', 'Mbit/s', 'data_rate', f'{{{{ value_json.nic_{field} | int }}}}',
-                         f'nic_{path}_{field}', 0)
-        self.state_class = 'measurement'
+        super().__init__(device, f'{path} {field}', 'data_rate', 'Mbit/s', f'{{{{ value_json.nic_{field} | round(2) }}}}',
+                         f'nic_{path}_{field}', 2)
         self.field = field
         self.path = path
         self.getter = getter
@@ -144,14 +137,14 @@ class NicTrack(Sensor):
         prev, prev_date = self.prev
         prev_delta = (tick.now - prev_date).total_seconds()
         self.state = ((self.getter(tick.net_counters[self.path]) - self.getter(prev)) * 8) / prev_delta
+        self.state = self.state / (1024 * 1024)
         self.prev = (tick.net_counters[self.path], tick.now)
         return tick.send_message(self.state_topic, {f'nic_{self.field}': self.state})
 
 class FanSensor(Sensor):
     def __init__(self, device: Device, path: str):
-        super().__init__(device, f'Fan {path}', 'rpm', None, f'{{{{ value_json.fan_rpm | int }}}}',
+        super().__init__(device, f'Fan {path}', None, 'RPM', f'{{{{ value_json.fan_rpm | int }}}}',
                          f'fan_{sanitize_name(path)}_rpm', 0)
-        self.state_class = 'measurement'
         self.path = path
 
     def on_tick(self, tick: Tick):
@@ -163,9 +156,8 @@ class FanSensor(Sensor):
 
 class TempSensor(Sensor):
     def __init__(self, device: Device, path: str):
-        super().__init__(device, f'Temp {path}', '°C',None, f'{{{{ value_json.temp | int }}}}',
+        super().__init__(device, f'Temp {path}', 'temperature', '°C', f'{{{{ value_json.temp | int }}}}',
                          f'temp_{sanitize_name(path)}', 2)
-        self.state_class = 'measurement'
         self.path = path
 
     def on_tick(self, tick: Tick):
@@ -200,12 +192,10 @@ def collection_handler(client: mqtt.Client):
     discovery.name = 'mqstats'
     discovery.version = '1.3'
     discovery.url = 'https://github.com/TheEvilRoot/mqstats'
-    device = Device(discovery, MQSTATS_DEVICE_NAME, platform.machine(), platform.machine())
+    device = Device(discovery, MQSTATS_DEVICE_NAME, sanitize_name(MQSTATS_DEVICE_NAME), platform.machine(), sanitize_name(platform.machine()))
     CpuPercent(device)
     CpuFreq(device)
     RamSensor(device, 'Memory%', 'memory_percent', lambda x: x.percent)
-    RamSensor(device, 'Memory used', 'memory_used', lambda x: x.percent)
-    RamSensor(device, 'Memory free', 'memory_free', lambda x: x.percent)
 
     for disk_name, disk_path in MQSTATS_DISKS.items():
         DiskPercent(device, disk_name, disk_path)
